@@ -1,3 +1,13 @@
+const USER_AGENT = "BundleCheck-Audit-Action/1.0 (https://github.com/bundlecheck/bundlecheck-audit-action)";
+
+function apiHeaders(apiKey: string, extra?: Record<string, string>): Record<string, string> {
+  return {
+    "User-Agent": USER_AGENT,
+    "X-API-Key": apiKey,
+    ...extra,
+  };
+}
+
 export type Budget = {
   per_package_gzip?: number;
   total_gzip?: number;
@@ -136,10 +146,7 @@ export async function postAudit(
 ): Promise<PostAuditResult> {
   const res = await fetch(`${apiUrl}/v1/api/audit`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-API-Key": apiKey,
-    },
+    headers: apiHeaders(apiKey, { "Content-Type": "application/json" }),
     body: JSON.stringify({
       packages: input.packages,
       budget: input.budget,
@@ -174,7 +181,7 @@ export async function pollAudit(
     await sleep(intervalSeconds * 1000);
 
     const res = await fetch(pollUrl, {
-      headers: { "X-API-Key": apiKey },
+      headers: apiHeaders(apiKey),
     });
 
     if (res.status === 202) {
