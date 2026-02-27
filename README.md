@@ -19,7 +19,7 @@ This action sends an exact `name@version` package list to the BundleCheck API, r
 | Input | Required | Default | Description |
 |---|---|---|---|
 | `api_key` | Yes | - | BundleCheck API key (`X-API-Key`) |
-| `packages` | Yes | - | Newline-separated exact `name@version` list |
+| `packages` | No | - | Newline-separated exact `name@version` list. When omitted, the action runs in lockfile compare mode. |
 | `per_package_gzip` | No | - | Per-package gzip budget in bytes |
 | `total_gzip` | No | - | Total gzip budget in bytes (sum of individual package costs) |
 | `fail_on_violation` | No | `true` | Fail when budget violations are found |
@@ -29,6 +29,8 @@ This action sends an exact `name@version` package list to the BundleCheck API, r
 | `api_url` | No | `https://bundlecheck.dev` | Override API base URL |
 | `poll_interval_seconds` | No | `3` | Poll interval for async audits |
 | `poll_timeout_seconds` | No | `300` | Max wait time for async audits |
+| `lockfile_path` | No | `package-lock.json` | Path to lockfile relative to repo root (lockfile compare mode only) |
+| `base_ref` | No | PR base branch | Git ref to diff against (lockfile compare mode only) |
 
 ## Outputs
 
@@ -76,6 +78,18 @@ jobs:
           echo "total_gzip=${{ steps.audit.outputs.total_gzip }}"
           echo "violations=${{ steps.audit.outputs.violation_count }}"
 ```
+
+## Required Permissions
+
+The action needs `pull-requests: write` to post or update the PR comment. Add this to your workflow:
+
+```yaml
+permissions:
+  contents: read
+  pull-requests: write
+```
+
+Without it the audit still runs and the workflow result is correct, but no comment will appear on the PR.
 
 ## Notes
 

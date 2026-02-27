@@ -1,6 +1,9 @@
 import * as core from "@actions/core";
-import { postAudit, pollAudit, type Budget } from "./api";
-import { renderComment } from "./render";
+import * as github from "@actions/github";
+import { execSync } from "node:child_process";
+import { readFileSync, existsSync } from "node:fs";
+import { postAudit, pollAudit, postCompare, type Budget } from "./api";
+import { renderComment, renderCompareComment } from "./render";
 import { upsertComment } from "./comment";
 
 function getIntInput(name: string, defaultValue: number): number {
@@ -26,17 +29,29 @@ function parseBudget(): Budget {
   return budget;
 }
 
-async function run(): Promise<void> {
-  const apiKey = core.getInput("api_key", { required: true });
-  const apiUrl = core.getInput("api_url") || "https://bundlecheck.dev";
-  const githubToken = core.getInput("github_token", { required: true });
-  const failOnViolation = core.getInput("fail_on_violation") !== "false";
-  const failOnPartial = core.getInput("fail_on_partial") === "true";
-  const warnOnly = core.getInput("warn_only") === "true";
-  const pollIntervalSeconds = getIntInput("poll_interval_seconds", 3);
-  const pollTimeoutSeconds = getIntInput("poll_timeout_seconds", 300);
+function prCommentWarning(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (msg.includes("Resource not accessible by integration")) {
+    return (
+      `Failed to post PR comment: the GITHUB_TOKEN lacks pull-requests: write permission. ` +
+      `Add the following to your workflow:\n\n` +
+      `permissions:\n  pull-requests: write`
+    );
+  }
+  return `Failed to post PR comment: ${msg}`;
+}
 
-  const rawPackages = core.getInput("packages", { required: true });
+async function runAuditMode(
+  apiUrl: string,
+  apiKey: string,
+  githubToken: string,
+  failOnViolation: boolean,
+  failOnPartial: boolean,
+  warnOnly: boolean,
+  pollIntervalSeconds: number,
+  pollTimeoutSeconds: number,
+  rawPackages: string
+): Promise<void> {
   const packages = parsePackages(rawPackages);
 
   if (packages.length === 0) {
@@ -47,88 +62,189 @@ async function run(): Promise<void> {
   core.info(`Auditing ${packages.length} package${packages.length > 1 ? "s" : ""}…`);
 
   const budget = parseBudget();
-  if (budget.per_package_gzip) {
-    core.info(`Budget: per_package_gzip = ${budget.per_package_gzip} bytes`);
-  }
-  if (budget.total_gzip) {
-    core.info(`Budget: total_gzip = ${budget.total_gzip} bytes`);
-  }
+  if (budget.per_package_gzip) core.info(`Budget: per_package_gzip = ${budget.per_package_gzip} bytes`);
+  if (budget.total_gzip) core.info(`Budget: total_gzip = ${budget.total_gzip} bytes`);
 
-  // POST /v1/api/audit
-  const postResult = await postAudit(apiUrl, apiKey, {
-    packages,
-    budget,
-    fail_on_partial: failOnPartial,
-  });
+  const postResult = await postAudit(apiUrl, apiKey, { packages, budget, fail_on_partial: failOnPartial });
 
   let audit;
-
   if (postResult.async) {
-    core.info(
-      `Audit queued (${packages.length} packages). Polling for results ` +
-        `(interval: ${pollIntervalSeconds}s, timeout: ${pollTimeoutSeconds}s)…`
-    );
-    audit = await pollAudit(
-      apiUrl,
-      apiKey,
-      postResult.analysisId,
-      pollIntervalSeconds,
-      pollTimeoutSeconds
-    );
+    core.info(`Audit queued (${packages.length} packages). Polling for results…`);
+    audit = await pollAudit(apiUrl, apiKey, postResult.analysisId, pollIntervalSeconds, pollTimeoutSeconds);
   } else {
     audit = postResult.data;
   }
 
-  // Set action outputs
   core.setOutput("pass", String(audit.pass));
   core.setOutput("total_gzip", String(audit.summary.total_gzip));
-  core.setOutput(
-    "violation_count",
-    String(audit.violations.filter((v) => v.package !== "(total)").length)
-  );
+  core.setOutput("violation_count", String(audit.violations.filter((v) => v.package !== "(total)").length));
 
-  // Log per-package summary to the workflow run
   for (const item of audit.results) {
     if (item.status === "ok") {
-      const flag = item.pass ? "✅" : "❌";
-      core.info(`  ${flag} ${item.package}: ${item.gzip} bytes gzip`);
+      core.info(`  ${item.pass ? "✅" : "❌"} ${item.package}: ${item.gzip} bytes gzip`);
     } else {
       core.warning(`  ⚠️  ${item.package}: ${item.status} — ${item.error_message}`);
     }
   }
 
-  // Post or update PR comment
   const commentBody = renderComment(audit);
   try {
     await upsertComment(githubToken, commentBody);
   } catch (err) {
-    // Comment failure is non-fatal — the audit result is still valid
-    core.warning(
-      `Failed to post PR comment: ${err instanceof Error ? err.message : String(err)}`
-    );
+    core.warning(prCommentWarning(err));
   }
 
-  // Determine exit code
-  if (!audit.pass && failOnViolation && !warnOnly) {
-    const pkgViolations = audit.violations.filter((v) => v.package !== "(total)");
-    const totalViolation = audit.violations.find((v) => v.package === "(total)");
+  applyExitCode(audit.pass, audit.violations, failOnViolation, failOnPartial, warnOnly);
+}
+
+async function runCompareMode(
+  apiUrl: string,
+  apiKey: string,
+  githubToken: string,
+  failOnViolation: boolean,
+  failOnPartial: boolean,
+  warnOnly: boolean
+): Promise<void> {
+  const lockfilePath = core.getInput("lockfile_path") || "package-lock.json";
+
+  // Resolve base ref: explicit input → PR base ref → fallback to origin/main
+  let baseRef = core.getInput("base_ref");
+  if (!baseRef) {
+    baseRef = github.context.payload.pull_request?.base?.ref
+      ? `origin/${github.context.payload.pull_request.base.ref}`
+      : "origin/main";
+  }
+
+  core.info(`Comparing ${lockfilePath} — base: ${baseRef}`);
+
+  // Check if the lockfile actually changed before making any API call.
+  // An unchanged lockfile means no packages were added or bumped — nothing to audit.
+  try {
+    const changed = execSync(`git diff --name-only ${baseRef} -- ${lockfilePath}`, {
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
+
+    if (!changed) {
+      core.info(`${lockfilePath} is unchanged — skipping audit.`);
+      core.setOutput("pass", "true");
+      core.setOutput("total_gzip", "0");
+      core.setOutput("violation_count", "0");
+      return;
+    }
+  } catch {
+    // git diff failed (shallow clone, detached HEAD, etc.) — continue and let the API handle it
+    core.warning("Could not determine if lockfile changed — proceeding with full compare.");
+  }
+
+  // Read head lockfile from disk
+  if (!existsSync(lockfilePath)) {
+    core.setFailed(`Lockfile not found: ${lockfilePath}. Run "actions/checkout" before this action.`);
+    return;
+  }
+  const headLockfile = readFileSync(lockfilePath, "utf-8");
+
+  // Read base lockfile from git
+  let baseLockfile: string;
+  try {
+    baseLockfile = execSync(`git show ${baseRef}:${lockfilePath}`, {
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+  } catch (err) {
+    // Base lockfile missing means this is a brand-new lockfile — treat everything as added
+    core.warning(
+      `Could not read ${lockfilePath} from ${baseRef} — treating all packages as new. ` +
+        `Make sure "actions/checkout" runs with fetch-depth: 0.`
+    );
+    baseLockfile = JSON.stringify({ lockfileVersion: 3, packages: {} });
+  }
+
+  const budget = parseBudget();
+  const compare = await postCompare(apiUrl, apiKey, baseLockfile, headLockfile, budget, failOnPartial);
+
+  core.setOutput("pass", String(compare.pass));
+  core.setOutput("total_gzip", String(compare.summary.total_new_gzip));
+  core.setOutput("violation_count", String(compare.violations.filter((v) => v.package !== "(total)").length));
+
+  const { added, changed, removed, summary } = compare;
+  if (added.length + changed.length + removed.length === 0) {
+    core.info("No package changes detected — nothing to audit.");
+  } else {
+    core.info(`Added: ${summary.added_count}  Changed: ${summary.changed_count}  Removed: ${summary.removed_count}`);
+    for (const item of [...added, ...changed]) {
+      if (item.status === "ok") {
+        core.info(`  ${item.pass ? "✅" : "❌"} ${item.package}: ${item.gzip} bytes gzip`);
+      } else {
+        core.warning(`  ⚠️  ${item.package}: ${item.status} — ${item.error_message}`);
+      }
+    }
+  }
+
+  const commentBody = renderCompareComment(compare);
+  try {
+    await upsertComment(githubToken, commentBody);
+  } catch (err) {
+    core.warning(prCommentWarning(err));
+  }
+
+  applyExitCode(compare.pass, compare.violations, failOnViolation, failOnPartial, warnOnly);
+}
+
+function applyExitCode(
+  pass: boolean,
+  violations: Array<{ package: string; over_by: number }>,
+  failOnViolation: boolean,
+  failOnPartial: boolean,
+  warnOnly: boolean
+): void {
+  if (!pass && failOnViolation && !warnOnly) {
+    const pkgViolations = violations.filter((v) => v.package !== "(total)");
+    const totalViolation = violations.find((v) => v.package === "(total)");
     const parts: string[] = [];
-    if (pkgViolations.length > 0) {
-      parts.push(
-        `${pkgViolations.length} package${pkgViolations.length > 1 ? "s" : ""} over per-package budget`
-      );
-    }
-    if (totalViolation) {
+    if (pkgViolations.length > 0)
+      parts.push(`${pkgViolations.length} package${pkgViolations.length > 1 ? "s" : ""} over per-package budget`);
+    if (totalViolation)
       parts.push(`total gzip over budget by ${totalViolation.over_by} bytes`);
-    }
-    if (parts.length === 0 && failOnPartial) {
+    if (parts.length === 0 && failOnPartial)
       parts.push("one or more packages could not be bundled");
-    }
     core.setFailed(`BundleCheck failed: ${parts.join("; ")}.`);
-  } else if (!audit.pass && warnOnly) {
+  } else if (!pass && warnOnly) {
     core.warning("BundleCheck found violations but warn_only is set — not failing the workflow.");
+  } else if (!pass) {
+    // fail_on_violation=false: report-only mode — violations exist but we don't fail
+    core.warning("BundleCheck found violations (fail_on_violation=false — reporting only).");
   } else {
     core.info("✅ BundleCheck passed.");
+  }
+}
+
+async function run(): Promise<void> {
+  const apiKey = core.getInput("api_key", { required: true });
+  const apiUrl = core.getInput("api_url") || "https://bundlecheck.dev";
+  const githubToken = core.getInput("github_token", { required: true });
+  const failOnViolation = core.getInput("fail_on_violation") !== "false";
+  const failOnPartial = core.getInput("fail_on_partial") === "true";
+  const warnOnly = core.getInput("warn_only") === "true";
+  const pollIntervalSeconds = getIntInput("poll_interval_seconds", 3);
+  const pollTimeoutSeconds = getIntInput("poll_timeout_seconds", 300);
+
+  // Mode detection: if "packages" is set → explicit audit mode
+  //                 otherwise → lockfile compare mode
+  const explicitPackages = core.getInput("packages");
+
+  if (explicitPackages.trim()) {
+    await runAuditMode(
+      apiUrl, apiKey, githubToken,
+      failOnViolation, failOnPartial, warnOnly,
+      pollIntervalSeconds, pollTimeoutSeconds,
+      explicitPackages
+    );
+  } else {
+    await runCompareMode(
+      apiUrl, apiKey, githubToken,
+      failOnViolation, failOnPartial, warnOnly
+    );
   }
 }
 

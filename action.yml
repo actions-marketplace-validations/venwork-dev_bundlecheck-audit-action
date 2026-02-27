@@ -14,10 +14,12 @@ inputs:
   packages:
     description: |
       Newline-separated list of exact name@version packages to audit.
+      When omitted, the action runs in lockfile compare mode — diffing base vs head
+      package-lock.json and auditing only added or changed packages.
       Example:
         react@18.2.0
         axios@1.6.7
-    required: true
+    required: false
 
   per_package_gzip:
     description: 'Per-package gzip budget in bytes. Packages exceeding this are flagged as violations.'
@@ -40,6 +42,19 @@ inputs:
   warn_only:
     description: 'Always exit 0 even if violations are found. Posts the comment but never fails the workflow.'
     default: 'false'
+
+  lockfile_path:
+    description: |
+      Path to package-lock.json relative to the repository root.
+      When provided (and packages is not set), the action diffs base vs head
+      lockfiles and audits only added/changed packages.
+    default: 'package-lock.json'
+
+  base_ref:
+    description: |
+      The base branch ref to diff against (e.g. main, origin/main).
+      Defaults to the PR base branch. Only used in lockfile mode.
+    default: ''
 
   github_token:
     description: 'GitHub token used to post PR comments. Defaults to the built-in GITHUB_TOKEN.'

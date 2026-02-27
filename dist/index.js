@@ -31919,195 +31919,6 @@ function getIDToken(aud) {
  */
 
 //# sourceMappingURL=core.js.map
-;// CONCATENATED MODULE: ./src/api.ts
-const USER_AGENT = "BundleCheck-Audit-Action/1.0 (https://github.com/bundlecheck/bundlecheck-audit-action)";
-function apiHeaders(apiKey, extra) {
-    return {
-        "User-Agent": USER_AGENT,
-        "X-API-Key": apiKey,
-        ...extra,
-    };
-}
-function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-}
-function truncate(text, max = 500) {
-    return text.length > max ? `${text.slice(0, max)}...` : text;
-}
-function getString(value) {
-    if (typeof value !== "string")
-        return null;
-    const trimmed = value.trim();
-    return trimmed.length > 0 ? trimmed : null;
-}
-function extractErrorMessage(value, depth = 0) {
-    if (depth > 4 || value == null)
-        return null;
-    const direct = getString(value);
-    if (direct)
-        return direct;
-    if (Array.isArray(value)) {
-        for (const item of value) {
-            const message = extractErrorMessage(item, depth + 1);
-            if (message)
-                return message;
-        }
-        return null;
-    }
-    if (typeof value !== "object")
-        return null;
-    const record = value;
-    const preferredKeys = [
-        "message",
-        "detail",
-        "error_description",
-        "title",
-        "reason",
-    ];
-    for (const key of preferredKeys) {
-        const message = getString(record[key]);
-        if (message)
-            return message;
-    }
-    for (const key of ["error", "errors"]) {
-        const message = extractErrorMessage(record[key], depth + 1);
-        if (message)
-            return message;
-    }
-    return null;
-}
-async function parseErrorMessage(res) {
-    const status = `HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ""}`;
-    try {
-        const raw = (await res.text()).trim();
-        if (!raw)
-            return status;
-        try {
-            const parsed = JSON.parse(raw);
-            const message = extractErrorMessage(parsed);
-            if (message)
-                return `${status}: ${truncate(message)}`;
-        }
-        catch {
-            // Not JSON: fall back to raw body text.
-        }
-        return `${status}: ${truncate(raw.replace(/\s+/g, " "))}`;
-    }
-    catch {
-        return status;
-    }
-}
-async function postAudit(apiUrl, apiKey, input) {
-    const res = await fetch(`${apiUrl}/v1/api/audit`, {
-        method: "POST",
-        headers: apiHeaders(apiKey, { "Content-Type": "application/json" }),
-        body: JSON.stringify({
-            packages: input.packages,
-            budget: input.budget,
-            fail_on_partial: input.fail_on_partial,
-        }),
-    });
-    if (res.status === 202) {
-        const body = (await res.json());
-        return { async: true, analysisId: body.analysis_id };
-    }
-    if (!res.ok) {
-        const message = await parseErrorMessage(res);
-        throw new Error(`Audit request failed: ${message}`);
-    }
-    return { async: false, data: (await res.json()) };
-}
-async function pollAudit(apiUrl, apiKey, analysisId, intervalSeconds, timeoutSeconds) {
-    const deadline = Date.now() + timeoutSeconds * 1000;
-    const pollUrl = `${apiUrl}/v1/api/audit/${analysisId}`;
-    while (Date.now() < deadline) {
-        await sleep(intervalSeconds * 1000);
-        const res = await fetch(pollUrl, {
-            headers: apiHeaders(apiKey),
-        });
-        if (res.status === 202) {
-            // Still pending — keep waiting
-            continue;
-        }
-        if (!res.ok) {
-            const message = await parseErrorMessage(res);
-            throw new Error(`Poll request failed: ${message}`);
-        }
-        const body = (await res.json());
-        return body;
-    }
-    throw new Error(`Audit timed out after ${timeoutSeconds}s. ` +
-        `Tip: batches of ≤20 packages are processed synchronously and are faster. ` +
-        `You can also increase poll_timeout_seconds.`);
-}
-
-;// CONCATENATED MODULE: ./src/render.ts
-const COMMENT_MARKER = "<!-- bundlecheck-audit -->";
-function formatBytes(bytes) {
-    if (bytes >= 1_000_000)
-        return `${(bytes / 1_000_000).toFixed(1)} MB`;
-    if (bytes >= 1_000)
-        return `${(bytes / 1_000).toFixed(1)} KB`;
-    return `${bytes} B`;
-}
-function statusCell(item) {
-    const emoji = {
-        ok: "✅",
-        denied: "⛔",
-        not_found: "🔍",
-        timeout: "⏱️",
-        error: "❌",
-    };
-    return `${emoji[item.status]} ${item.status}`;
-}
-function resultCell(item, violationMap) {
-    if (item.status !== "ok")
-        return "—";
-    if (!item.pass) {
-        const v = violationMap.get(item.package);
-        return v ? `❌ over by ${formatBytes(v.over_by)}` : "❌";
-    }
-    return "✅";
-}
-function renderComment(audit) {
-    const { pass, results, violations, summary } = audit;
-    const violationMap = new Map(violations.filter((v) => v.package !== "(total)").map((v) => [v.package, v]));
-    const totalViolation = violations.find((v) => v.package === "(total)");
-    const heading = pass
-        ? "## ✅ BundleCheck — all packages within budget"
-        : "## ❌ BundleCheck — budget violations detected";
-    const tableRows = results.map((item) => {
-        const gzip = item.status === "ok" ? formatBytes(item.gzip) : "—";
-        return `| \`${item.package}\` | ${gzip} | ${statusCell(item)} | ${resultCell(item, violationMap)} |`;
-    });
-    const totalResultCell = totalViolation
-        ? `❌ over by ${formatBytes(totalViolation.over_by)}`
-        : summary.ok_count > 0
-            ? "✅"
-            : "—";
-    const table = [
-        "| Package | Gzip | Status | Result |",
-        "|---|---|---|---|",
-        ...tableRows,
-        `| **Total** | **${formatBytes(summary.total_gzip)}** | | ${totalResultCell} |`,
-    ].join("\n");
-    const lines = [
-        COMMENT_MARKER,
-        heading,
-        "",
-        table,
-        "",
-        `> ⚠️ \`total_gzip\` is the **sum of individual package costs** — not your real app bundle size (deduplication and tree-shaking are not accounted for).`,
-    ];
-    if (summary.skipped_count > 0) {
-        lines.push(`> ℹ️ ${summary.skipped_count} package${summary.skipped_count > 1 ? "s" : ""} skipped (denied, not found, or errored).`);
-    }
-    if (summary.warning) {
-        lines.push(`> ⚠️ ${summary.warning}`);
-    }
-    return lines.join("\n");
-}
-
 ;// CONCATENATED MODULE: ./node_modules/@actions/github/lib/context.js
 
 
@@ -36329,6 +36140,301 @@ function getOctokit(token, options, ...additionalPlugins) {
     return new GitHubWithPlugins(getOctokitOptions(token, options));
 }
 //# sourceMappingURL=github.js.map
+;// CONCATENATED MODULE: external "node:child_process"
+const external_node_child_process_namespaceObject = require("node:child_process");
+;// CONCATENATED MODULE: external "node:fs"
+const external_node_fs_namespaceObject = require("node:fs");
+;// CONCATENATED MODULE: ./src/api.ts
+const USER_AGENT = "BundleCheck-Audit-Action/1.0 (https://github.com/bundlecheck/bundlecheck-audit-action)";
+function apiHeaders(apiKey, extra) {
+    return {
+        "User-Agent": USER_AGENT,
+        "X-API-Key": apiKey,
+        ...extra,
+    };
+}
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+function truncate(text, max = 500) {
+    return text.length > max ? `${text.slice(0, max)}...` : text;
+}
+function getString(value) {
+    if (typeof value !== "string")
+        return null;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+}
+function extractErrorMessage(value, depth = 0) {
+    if (depth > 4 || value == null)
+        return null;
+    const direct = getString(value);
+    if (direct)
+        return direct;
+    if (Array.isArray(value)) {
+        for (const item of value) {
+            const message = extractErrorMessage(item, depth + 1);
+            if (message)
+                return message;
+        }
+        return null;
+    }
+    if (typeof value !== "object")
+        return null;
+    const record = value;
+    const preferredKeys = [
+        "message",
+        "detail",
+        "error_description",
+        "title",
+        "reason",
+    ];
+    for (const key of preferredKeys) {
+        const message = getString(record[key]);
+        if (message)
+            return message;
+    }
+    for (const key of ["error", "errors"]) {
+        const message = extractErrorMessage(record[key], depth + 1);
+        if (message)
+            return message;
+    }
+    return null;
+}
+async function parseErrorMessage(res) {
+    const status = `HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ""}`;
+    try {
+        const raw = (await res.text()).trim();
+        if (!raw)
+            return status;
+        try {
+            const parsed = JSON.parse(raw);
+            const message = extractErrorMessage(parsed);
+            if (message)
+                return `${status}: ${truncate(message)}`;
+        }
+        catch {
+            // Not JSON: fall back to raw body text.
+        }
+        return `${status}: ${truncate(raw.replace(/\s+/g, " "))}`;
+    }
+    catch {
+        return status;
+    }
+}
+async function postAudit(apiUrl, apiKey, input) {
+    const res = await fetch(`${apiUrl}/v1/api/audit`, {
+        method: "POST",
+        headers: apiHeaders(apiKey, { "Content-Type": "application/json" }),
+        body: JSON.stringify({
+            packages: input.packages,
+            budget: input.budget,
+            fail_on_partial: input.fail_on_partial,
+        }),
+    });
+    if (res.status === 202) {
+        const body = (await res.json());
+        return { async: true, analysisId: body.analysis_id };
+    }
+    if (!res.ok) {
+        const message = await parseErrorMessage(res);
+        throw new Error(`Audit request failed: ${message}`);
+    }
+    return { async: false, data: (await res.json()) };
+}
+async function pollAudit(apiUrl, apiKey, analysisId, intervalSeconds, timeoutSeconds) {
+    const deadline = Date.now() + timeoutSeconds * 1000;
+    const pollUrl = `${apiUrl}/v1/api/audit/${analysisId}`;
+    while (Date.now() < deadline) {
+        await sleep(intervalSeconds * 1000);
+        const res = await fetch(pollUrl, {
+            headers: apiHeaders(apiKey),
+        });
+        if (res.status === 202) {
+            // Still pending — keep waiting
+            continue;
+        }
+        if (!res.ok) {
+            const message = await parseErrorMessage(res);
+            throw new Error(`Poll request failed: ${message}`);
+        }
+        const body = (await res.json());
+        return body;
+    }
+    throw new Error(`Audit timed out after ${timeoutSeconds}s. ` +
+        `Tip: batches of ≤20 packages are processed synchronously and are faster. ` +
+        `You can also increase poll_timeout_seconds.`);
+}
+async function postCompare(apiUrl, apiKey, baseLockfile, headLockfile, budget, failOnPartial) {
+    const res = await fetch(`${apiUrl}/v1/api/compare`, {
+        method: "POST",
+        headers: apiHeaders(apiKey, { "Content-Type": "application/json" }),
+        body: JSON.stringify({
+            base_lockfile: baseLockfile,
+            head_lockfile: headLockfile,
+            budget,
+            fail_on_partial: failOnPartial,
+        }),
+    });
+    if (!res.ok) {
+        const message = await parseErrorMessage(res);
+        throw new Error(`Compare request failed: ${message}`);
+    }
+    return (await res.json());
+}
+
+;// CONCATENATED MODULE: ./src/render.ts
+const COMMENT_MARKER = "<!-- bundlecheck-audit -->";
+function formatBytes(bytes) {
+    if (bytes >= 1_000_000)
+        return `${(bytes / 1_000_000).toFixed(1)} MB`;
+    if (bytes >= 1_000)
+        return `${(bytes / 1_000).toFixed(1)} KB`;
+    return `${bytes} B`;
+}
+function statusCell(item) {
+    const emoji = {
+        ok: "✅",
+        denied: "⛔",
+        not_found: "🔍",
+        timeout: "⏱️",
+        error: "❌",
+    };
+    return `${emoji[item.status]} ${item.status}`;
+}
+function resultCell(item, violationMap) {
+    if (item.status !== "ok")
+        return "—";
+    if (!item.pass) {
+        const v = violationMap.get(item.package);
+        return v ? `❌ over by ${formatBytes(v.over_by)}` : "❌";
+    }
+    return "✅";
+}
+function renderComment(audit) {
+    const { pass, results, violations, summary } = audit;
+    const violationMap = new Map(violations.filter((v) => v.package !== "(total)").map((v) => [v.package, v]));
+    const totalViolation = violations.find((v) => v.package === "(total)");
+    const heading = pass
+        ? "## ✅ BundleCheck — all packages within budget"
+        : "## ❌ BundleCheck — budget violations detected";
+    const tableRows = results.map((item) => {
+        const gzip = item.status === "ok" ? formatBytes(item.gzip) : "—";
+        return `| \`${item.package}\` | ${gzip} | ${statusCell(item)} | ${resultCell(item, violationMap)} |`;
+    });
+    const totalResultCell = totalViolation
+        ? `❌ over by ${formatBytes(totalViolation.over_by)}`
+        : summary.ok_count > 0
+            ? "✅"
+            : "—";
+    const table = [
+        "| Package | Gzip | Status | Result |",
+        "|---|---|---|---|",
+        ...tableRows,
+        `| **Total** | **${formatBytes(summary.total_gzip)}** | | ${totalResultCell} |`,
+    ].join("\n");
+    const lines = [
+        COMMENT_MARKER,
+        heading,
+        "",
+        table,
+        "",
+        `> ⚠️ \`total_gzip\` is the **sum of individual package costs** — not your real app bundle size (deduplication and tree-shaking are not accounted for).`,
+    ];
+    if (summary.skipped_count > 0) {
+        lines.push(`> ℹ️ ${summary.skipped_count} package${summary.skipped_count > 1 ? "s" : ""} skipped (denied, not found, or errored).`);
+    }
+    if (summary.warning) {
+        lines.push(`> ⚠️ ${summary.warning}`);
+    }
+    return lines.join("\n");
+}
+// --- Compare comment ---
+function formatDelta(delta) {
+    if (delta === null)
+        return "—";
+    if (delta === 0)
+        return "±0";
+    return delta > 0 ? `+${formatBytes(delta)}` : `-${formatBytes(Math.abs(delta))}`;
+}
+function compareItemRow(item, violationMap, showPrevious) {
+    const gzip = item.status === "ok" ? formatBytes(item.gzip) : "—";
+    const prev = showPrevious
+        ? item.previous_gzip != null
+            ? formatBytes(item.previous_gzip)
+            : "—"
+        : null;
+    const delta = item.status === "ok" ? formatDelta(item.gzip_delta) : "—";
+    let result;
+    if (item.status !== "ok") {
+        result = `⚠️ ${item.status}`;
+    }
+    else if (!item.pass) {
+        const v = violationMap.get(item.package);
+        result = v ? `❌ over by ${formatBytes(v.over_by)}` : "❌";
+    }
+    else {
+        result = "✅";
+    }
+    const cells = showPrevious
+        ? [`\`${item.package}\``, prev ?? "—", gzip, delta, result]
+        : [`\`${item.package}\``, gzip, delta, result];
+    return `| ${cells.join(" | ")} |`;
+}
+function renderCompareComment(compare) {
+    const { pass, added, changed, removed, violations, summary } = compare;
+    const violationMap = new Map(violations.filter((v) => v.package !== "(total)").map((v) => [v.package, v]));
+    const totalViolation = violations.find((v) => v.package === "(total)");
+    const heading = pass
+        ? "## ✅ BundleCheck — no size regressions"
+        : "## ❌ BundleCheck — size budget violated";
+    const lines = [COMMENT_MARKER, heading, ""];
+    // Added section
+    if (added.length > 0) {
+        lines.push(`### Added (${added.length})`);
+        lines.push("| Package | Gzip | Delta | Result |");
+        lines.push("|---|---|---|---|");
+        for (const item of added) {
+            lines.push(compareItemRow(item, violationMap, false));
+        }
+        lines.push("");
+    }
+    // Changed section
+    if (changed.length > 0) {
+        lines.push(`### Changed (${changed.length})`);
+        lines.push("| Package | Before | After | Delta | Result |");
+        lines.push("|---|---|---|---|---|");
+        for (const item of changed) {
+            lines.push(compareItemRow(item, violationMap, true));
+        }
+        lines.push("");
+    }
+    // Removed section (no sizes — just listing)
+    if (removed.length > 0) {
+        lines.push(`### Removed (${removed.length})`);
+        lines.push("| Package |");
+        lines.push("|---|");
+        for (const item of removed) {
+            lines.push(`| \`${item.package}\` |`);
+        }
+        lines.push("");
+    }
+    // Summary row
+    const deltaStr = formatDelta(summary.total_gzip_delta);
+    const totalResult = totalViolation
+        ? `❌ over by ${formatBytes(totalViolation.over_by)}`
+        : summary.added_count + summary.changed_count > 0
+            ? "✅"
+            : "—";
+    lines.push(`**Total new gzip:** ${formatBytes(summary.total_new_gzip)} (delta: ${deltaStr}) ${totalResult}`);
+    lines.push("");
+    lines.push(`> ⚠️ \`total_gzip\` is the **sum of individual package costs** — not your real app bundle size.`);
+    if (summary.warning) {
+        lines.push(`> ⚠️ ${summary.warning}`);
+    }
+    return lines.join("\n");
+}
+
 ;// CONCATENATED MODULE: ./src/comment.ts
 
 
@@ -36393,6 +36499,9 @@ async function upsertComment(token, body) {
 
 
 
+
+
+
 function getIntInput(name, defaultValue) {
     const raw = getInput(name);
     if (!raw)
@@ -36416,6 +36525,158 @@ function parseBudget() {
         budget.total_gzip = total;
     return budget;
 }
+function prCommentWarning(err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("Resource not accessible by integration")) {
+        return (`Failed to post PR comment: the GITHUB_TOKEN lacks pull-requests: write permission. ` +
+            `Add the following to your workflow:\n\n` +
+            `permissions:\n  pull-requests: write`);
+    }
+    return `Failed to post PR comment: ${msg}`;
+}
+async function runAuditMode(apiUrl, apiKey, githubToken, failOnViolation, failOnPartial, warnOnly, pollIntervalSeconds, pollTimeoutSeconds, rawPackages) {
+    const packages = parsePackages(rawPackages);
+    if (packages.length === 0) {
+        setFailed("No packages provided. Add at least one name@version entry.");
+        return;
+    }
+    info(`Auditing ${packages.length} package${packages.length > 1 ? "s" : ""}…`);
+    const budget = parseBudget();
+    if (budget.per_package_gzip)
+        info(`Budget: per_package_gzip = ${budget.per_package_gzip} bytes`);
+    if (budget.total_gzip)
+        info(`Budget: total_gzip = ${budget.total_gzip} bytes`);
+    const postResult = await postAudit(apiUrl, apiKey, { packages, budget, fail_on_partial: failOnPartial });
+    let audit;
+    if (postResult.async) {
+        info(`Audit queued (${packages.length} packages). Polling for results…`);
+        audit = await pollAudit(apiUrl, apiKey, postResult.analysisId, pollIntervalSeconds, pollTimeoutSeconds);
+    }
+    else {
+        audit = postResult.data;
+    }
+    setOutput("pass", String(audit.pass));
+    setOutput("total_gzip", String(audit.summary.total_gzip));
+    setOutput("violation_count", String(audit.violations.filter((v) => v.package !== "(total)").length));
+    for (const item of audit.results) {
+        if (item.status === "ok") {
+            info(`  ${item.pass ? "✅" : "❌"} ${item.package}: ${item.gzip} bytes gzip`);
+        }
+        else {
+            warning(`  ⚠️  ${item.package}: ${item.status} — ${item.error_message}`);
+        }
+    }
+    const commentBody = renderComment(audit);
+    try {
+        await upsertComment(githubToken, commentBody);
+    }
+    catch (err) {
+        warning(prCommentWarning(err));
+    }
+    applyExitCode(audit.pass, audit.violations, failOnViolation, failOnPartial, warnOnly);
+}
+async function runCompareMode(apiUrl, apiKey, githubToken, failOnViolation, failOnPartial, warnOnly) {
+    const lockfilePath = getInput("lockfile_path") || "package-lock.json";
+    // Resolve base ref: explicit input → PR base ref → fallback to origin/main
+    let baseRef = getInput("base_ref");
+    if (!baseRef) {
+        baseRef = github_context.payload.pull_request?.base?.ref
+            ? `origin/${github_context.payload.pull_request.base.ref}`
+            : "origin/main";
+    }
+    info(`Comparing ${lockfilePath} — base: ${baseRef}`);
+    // Check if the lockfile actually changed before making any API call.
+    // An unchanged lockfile means no packages were added or bumped — nothing to audit.
+    try {
+        const changed = (0,external_node_child_process_namespaceObject.execSync)(`git diff --name-only ${baseRef} -- ${lockfilePath}`, {
+            encoding: "utf-8",
+            stdio: ["pipe", "pipe", "pipe"],
+        }).trim();
+        if (!changed) {
+            info(`${lockfilePath} is unchanged — skipping audit.`);
+            setOutput("pass", "true");
+            setOutput("total_gzip", "0");
+            setOutput("violation_count", "0");
+            return;
+        }
+    }
+    catch {
+        // git diff failed (shallow clone, detached HEAD, etc.) — continue and let the API handle it
+        warning("Could not determine if lockfile changed — proceeding with full compare.");
+    }
+    // Read head lockfile from disk
+    if (!(0,external_node_fs_namespaceObject.existsSync)(lockfilePath)) {
+        setFailed(`Lockfile not found: ${lockfilePath}. Run "actions/checkout" before this action.`);
+        return;
+    }
+    const headLockfile = (0,external_node_fs_namespaceObject.readFileSync)(lockfilePath, "utf-8");
+    // Read base lockfile from git
+    let baseLockfile;
+    try {
+        baseLockfile = (0,external_node_child_process_namespaceObject.execSync)(`git show ${baseRef}:${lockfilePath}`, {
+            encoding: "utf-8",
+            stdio: ["pipe", "pipe", "pipe"],
+        });
+    }
+    catch (err) {
+        // Base lockfile missing means this is a brand-new lockfile — treat everything as added
+        warning(`Could not read ${lockfilePath} from ${baseRef} — treating all packages as new. ` +
+            `Make sure "actions/checkout" runs with fetch-depth: 0.`);
+        baseLockfile = JSON.stringify({ lockfileVersion: 3, packages: {} });
+    }
+    const budget = parseBudget();
+    const compare = await postCompare(apiUrl, apiKey, baseLockfile, headLockfile, budget, failOnPartial);
+    setOutput("pass", String(compare.pass));
+    setOutput("total_gzip", String(compare.summary.total_new_gzip));
+    setOutput("violation_count", String(compare.violations.filter((v) => v.package !== "(total)").length));
+    const { added, changed, removed, summary } = compare;
+    if (added.length + changed.length + removed.length === 0) {
+        info("No package changes detected — nothing to audit.");
+    }
+    else {
+        info(`Added: ${summary.added_count}  Changed: ${summary.changed_count}  Removed: ${summary.removed_count}`);
+        for (const item of [...added, ...changed]) {
+            if (item.status === "ok") {
+                info(`  ${item.pass ? "✅" : "❌"} ${item.package}: ${item.gzip} bytes gzip`);
+            }
+            else {
+                warning(`  ⚠️  ${item.package}: ${item.status} — ${item.error_message}`);
+            }
+        }
+    }
+    const commentBody = renderCompareComment(compare);
+    try {
+        await upsertComment(githubToken, commentBody);
+    }
+    catch (err) {
+        warning(prCommentWarning(err));
+    }
+    applyExitCode(compare.pass, compare.violations, failOnViolation, failOnPartial, warnOnly);
+}
+function applyExitCode(pass, violations, failOnViolation, failOnPartial, warnOnly) {
+    if (!pass && failOnViolation && !warnOnly) {
+        const pkgViolations = violations.filter((v) => v.package !== "(total)");
+        const totalViolation = violations.find((v) => v.package === "(total)");
+        const parts = [];
+        if (pkgViolations.length > 0)
+            parts.push(`${pkgViolations.length} package${pkgViolations.length > 1 ? "s" : ""} over per-package budget`);
+        if (totalViolation)
+            parts.push(`total gzip over budget by ${totalViolation.over_by} bytes`);
+        if (parts.length === 0 && failOnPartial)
+            parts.push("one or more packages could not be bundled");
+        setFailed(`BundleCheck failed: ${parts.join("; ")}.`);
+    }
+    else if (!pass && warnOnly) {
+        warning("BundleCheck found violations but warn_only is set — not failing the workflow.");
+    }
+    else if (!pass) {
+        // fail_on_violation=false: report-only mode — violations exist but we don't fail
+        warning("BundleCheck found violations (fail_on_violation=false — reporting only).");
+    }
+    else {
+        info("✅ BundleCheck passed.");
+    }
+}
 async function run() {
     const apiKey = getInput("api_key", { required: true });
     const apiUrl = getInput("api_url") || "https://bundlecheck.dev";
@@ -36425,79 +36686,14 @@ async function run() {
     const warnOnly = getInput("warn_only") === "true";
     const pollIntervalSeconds = getIntInput("poll_interval_seconds", 3);
     const pollTimeoutSeconds = getIntInput("poll_timeout_seconds", 300);
-    const rawPackages = getInput("packages", { required: true });
-    const packages = parsePackages(rawPackages);
-    if (packages.length === 0) {
-        setFailed("No packages provided. Add at least one name@version entry.");
-        return;
-    }
-    info(`Auditing ${packages.length} package${packages.length > 1 ? "s" : ""}…`);
-    const budget = parseBudget();
-    if (budget.per_package_gzip) {
-        info(`Budget: per_package_gzip = ${budget.per_package_gzip} bytes`);
-    }
-    if (budget.total_gzip) {
-        info(`Budget: total_gzip = ${budget.total_gzip} bytes`);
-    }
-    // POST /v1/api/audit
-    const postResult = await postAudit(apiUrl, apiKey, {
-        packages,
-        budget,
-        fail_on_partial: failOnPartial,
-    });
-    let audit;
-    if (postResult.async) {
-        info(`Audit queued (${packages.length} packages). Polling for results ` +
-            `(interval: ${pollIntervalSeconds}s, timeout: ${pollTimeoutSeconds}s)…`);
-        audit = await pollAudit(apiUrl, apiKey, postResult.analysisId, pollIntervalSeconds, pollTimeoutSeconds);
+    // Mode detection: if "packages" is set → explicit audit mode
+    //                 otherwise → lockfile compare mode
+    const explicitPackages = getInput("packages");
+    if (explicitPackages.trim()) {
+        await runAuditMode(apiUrl, apiKey, githubToken, failOnViolation, failOnPartial, warnOnly, pollIntervalSeconds, pollTimeoutSeconds, explicitPackages);
     }
     else {
-        audit = postResult.data;
-    }
-    // Set action outputs
-    setOutput("pass", String(audit.pass));
-    setOutput("total_gzip", String(audit.summary.total_gzip));
-    setOutput("violation_count", String(audit.violations.filter((v) => v.package !== "(total)").length));
-    // Log per-package summary to the workflow run
-    for (const item of audit.results) {
-        if (item.status === "ok") {
-            const flag = item.pass ? "✅" : "❌";
-            info(`  ${flag} ${item.package}: ${item.gzip} bytes gzip`);
-        }
-        else {
-            warning(`  ⚠️  ${item.package}: ${item.status} — ${item.error_message}`);
-        }
-    }
-    // Post or update PR comment
-    const commentBody = renderComment(audit);
-    try {
-        await upsertComment(githubToken, commentBody);
-    }
-    catch (err) {
-        // Comment failure is non-fatal — the audit result is still valid
-        warning(`Failed to post PR comment: ${err instanceof Error ? err.message : String(err)}`);
-    }
-    // Determine exit code
-    if (!audit.pass && failOnViolation && !warnOnly) {
-        const pkgViolations = audit.violations.filter((v) => v.package !== "(total)");
-        const totalViolation = audit.violations.find((v) => v.package === "(total)");
-        const parts = [];
-        if (pkgViolations.length > 0) {
-            parts.push(`${pkgViolations.length} package${pkgViolations.length > 1 ? "s" : ""} over per-package budget`);
-        }
-        if (totalViolation) {
-            parts.push(`total gzip over budget by ${totalViolation.over_by} bytes`);
-        }
-        if (parts.length === 0 && failOnPartial) {
-            parts.push("one or more packages could not be bundled");
-        }
-        setFailed(`BundleCheck failed: ${parts.join("; ")}.`);
-    }
-    else if (!audit.pass && warnOnly) {
-        warning("BundleCheck found violations but warn_only is set — not failing the workflow.");
-    }
-    else {
-        info("✅ BundleCheck passed.");
+        await runCompareMode(apiUrl, apiKey, githubToken, failOnViolation, failOnPartial, warnOnly);
     }
 }
 run().catch((err) => {
