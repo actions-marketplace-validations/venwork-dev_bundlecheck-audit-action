@@ -41,7 +41,7 @@ inputs:
 
   warn_only:
     description: 'Always exit 0 even if violations are found. Posts the comment but never fails the workflow.'
-    default: 'false'
+    default: 'true'
 
   lockfile_path:
     description: |

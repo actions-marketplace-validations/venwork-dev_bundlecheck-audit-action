@@ -1,11 +1,8 @@
 name: Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "SemVer version to release (for example: 1.2.3 or v1.2.3)"
-        required: true
+  push:
+    branches: [main]
 
 permissions:
   contents: write
@@ -15,14 +12,21 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout main
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # 6.0.2
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
         with:
-          ref: main
           fetch-depth: 0
 
+      - name: Compute next version
+        id: semver
+        uses: PaulHatch/semantic-version@f29500c9d60a99ed5168e39ee367e0976884c46e # 6.0.1
+        with:
+          tag_prefix: "v"
+          major_pattern: "SKIP_MAJOR"  # disabled — no major bumps until prod
+          bump_each_commit: true
+
       - name: Setup Bun
-        uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # 2.1.2
+        uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -30,64 +34,38 @@ jobs:
       - name: Rebuild dist
         run: bun run build
 
-      - name: Parse and validate version
-        id: version
-        env:
-          INPUT_VERSION: ${{ github.event.inputs.version }}
-        run: |
-          VERSION="${INPUT_VERSION#v}"
-          if ! echo "${VERSION}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "Version must be SemVer in the form X.Y.Z (example: 1.2.3)."
-            exit 1
-          fi
-
-          IFS='.' read -r MAJOR MINOR PATCH <<< "${VERSION}"
-          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
-          echo "release_tag=v${VERSION}" >> "${GITHUB_OUTPUT}"
-          echo "major_tag=v${MAJOR}" >> "${GITHUB_OUTPUT}"
-
-      - name: Ensure release tag does not exist
-        env:
-          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
-        run: |
-          if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
-            echo "Tag ${RELEASE_TAG} already exists on origin."
-            exit 1
-          fi
-
       - name: Commit rebuilt dist if needed
         id: dist_commit
         env:
-          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+          VERSION_TAG: ${{ steps.semver.outputs.version_tag }}
         run: |
           if git diff --quiet -- dist; then
             echo "created=false" >> "${GITHUB_OUTPUT}"
             echo "dist is already up to date."
-            exit 0
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add dist
+            git commit -m "chore(release): build dist for ${VERSION_TAG} [skip ci]"
+            echo "created=true" >> "${GITHUB_OUTPUT}"
           fi
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add dist
-          git commit -m "chore(release): build dist for ${RELEASE_TAG}"
-          echo "created=true" >> "${GITHUB_OUTPUT}"
-
-      - name: Push release commit
+      - name: Push dist commit
         if: steps.dist_commit.outputs.created == 'true'
         run: git push origin HEAD:main
 
       - name: Create and push version tags
         env:
-          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
-          MAJOR_TAG: ${{ steps.version.outputs.major_tag }}
+          VERSION_TAG: ${{ steps.semver.outputs.version_tag }}
         run: |
-          git tag "${RELEASE_TAG}"
+          MAJOR_TAG="v$(echo "${VERSION_TAG#v}" | cut -d. -f1)"
+          git tag "${VERSION_TAG}"
           git tag -f "${MAJOR_TAG}"
-          git push origin "refs/tags/${RELEASE_TAG}"
+          git push origin "refs/tags/${VERSION_TAG}"
           git push origin "refs/tags/${MAJOR_TAG}" --force
 
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # 2.5.0
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
         with:
-          tag_name: ${{ steps.version.outputs.release_tag }}
+          tag_name: ${{ steps.semver.outputs.version_tag }}
           generate_release_notes: true
