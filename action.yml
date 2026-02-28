@@ -43,13 +43,9 @@ inputs:
     description: 'Always exit 0 even if violations are found. Posts the comment but never fails the workflow.'
     default: 'true'
 
-  lockfile_path:
-    description: |
-      Path to the lockfile relative to the repository root.
-      Supports package-lock.json (npm v2/v3) and yarn.lock (yarn v1 and berry).
-      When provided (and packages is not set), the action diffs base vs head
-      lockfiles and audits only added/changed packages.
-    default: 'package-lock.json'
+  package_json_path:
+    description: 'Path to package.json relative to the repository root. Used in compare mode to diff production dependencies.'
+    default: 'package.json'
 
   base_ref:
     description: |

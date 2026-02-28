@@ -36265,23 +36265,6 @@ async function pollAudit(apiUrl, apiKey, analysisId, intervalSeconds, timeoutSec
         `Tip: batches of ≤20 packages are processed synchronously and are faster. ` +
         `You can also increase poll_timeout_seconds.`);
 }
-async function postCompare(apiUrl, apiKey, baseLockfile, headLockfile, budget, failOnPartial) {
-    const res = await fetch(`${apiUrl}/v1/api/compare`, {
-        method: "POST",
-        headers: apiHeaders(apiKey, { "Content-Type": "application/json" }),
-        body: JSON.stringify({
-            base_lockfile: baseLockfile,
-            head_lockfile: headLockfile,
-            budget,
-            fail_on_partial: failOnPartial,
-        }),
-    });
-    if (!res.ok) {
-        const message = await parseErrorMessage(res);
-        throw new Error(`Compare request failed: ${message}`);
-    }
-    return (await res.json());
-}
 
 ;// CONCATENATED MODULE: ./src/render.ts
 const COMMENT_MARKER = "<!-- bundlecheck-audit -->";
@@ -36349,88 +36332,80 @@ function renderComment(audit) {
     }
     return lines.join("\n");
 }
-// --- Compare comment ---
-function formatDelta(delta) {
-    if (delta === null)
+function extractPackageName(nameAtVersion) {
+    // @scope/pkg@1.0.0 → @scope/pkg,  pkg@1.0.0 → pkg
+    if (nameAtVersion.startsWith("@")) {
+        const rest = nameAtVersion.slice(1);
+        const afterSlash = rest.slice(rest.indexOf("/") + 1);
+        const atIdx = afterSlash.indexOf("@");
+        return atIdx !== -1 ? `@${rest.slice(0, rest.indexOf("/") + 1)}${afterSlash.slice(0, atIdx)}` : nameAtVersion;
+    }
+    return nameAtVersion.split("@")[0];
+}
+function auditResultCell(name, resultByName, violationByName) {
+    const item = resultByName.get(name);
+    if (!item)
         return "—";
-    if (delta === 0)
-        return "±0";
-    return delta > 0 ? `+${formatBytes(delta)}` : `-${formatBytes(Math.abs(delta))}`;
+    if (item.status !== "ok")
+        return `⚠️ ${item.status}`;
+    const v = violationByName.get(name);
+    return v ? `❌ over by ${formatBytes(v.over_by)}` : "✅";
 }
-function compareItemRow(item, violationMap, showPrevious) {
-    const gzip = item.status === "ok" ? formatBytes(item.gzip) : "—";
-    const prev = showPrevious
-        ? item.previous_gzip != null
-            ? formatBytes(item.previous_gzip)
-            : "—"
-        : null;
-    const delta = item.status === "ok" ? formatDelta(item.gzip_delta) : "—";
-    let result;
-    if (item.status !== "ok") {
-        result = `⚠️ ${item.status}`;
+function renderDepsComment(data) {
+    const { added, changed, removed, audit } = data;
+    const resultByName = new Map();
+    const violationByName = new Map();
+    if (audit) {
+        for (const item of audit.results) {
+            resultByName.set(extractPackageName(item.package), item);
+        }
+        for (const v of audit.violations.filter((v) => v.package !== "(total)")) {
+            violationByName.set(extractPackageName(v.package), v);
+        }
     }
-    else if (!item.pass) {
-        const v = violationMap.get(item.package);
-        result = v ? `❌ over by ${formatBytes(v.over_by)}` : "❌";
-    }
-    else {
-        result = "✅";
-    }
-    const cells = showPrevious
-        ? [`\`${item.package}\``, prev ?? "—", gzip, delta, result]
-        : [`\`${item.package}\``, gzip, delta, result];
-    return `| ${cells.join(" | ")} |`;
-}
-function renderCompareComment(compare) {
-    const { pass, added, changed, removed, violations, summary } = compare;
-    const violationMap = new Map(violations.filter((v) => v.package !== "(total)").map((v) => [v.package, v]));
-    const totalViolation = violations.find((v) => v.package === "(total)");
+    const totalViolation = audit?.violations.find((v) => v.package === "(total)");
+    const pass = !audit || audit.pass;
     const heading = pass
         ? "## ✅ BundleCheck — no size regressions"
         : "## ❌ BundleCheck — size budget violated";
     const lines = [COMMENT_MARKER, heading, ""];
-    // Added section
     if (added.length > 0) {
         lines.push(`### Added (${added.length})`);
-        lines.push("| Package | Gzip | Delta | Result |");
+        lines.push("| Package | Version | Gzip | Result |");
         lines.push("|---|---|---|---|");
-        for (const item of added) {
-            lines.push(compareItemRow(item, violationMap, false));
+        for (const dep of added) {
+            const item = resultByName.get(dep.name);
+            const gzip = item?.status === "ok" ? formatBytes(item.gzip) : "—";
+            lines.push(`| \`${dep.name}\` | ${dep.version} | ${gzip} | ${auditResultCell(dep.name, resultByName, violationByName)} |`);
         }
         lines.push("");
     }
-    // Changed section
     if (changed.length > 0) {
-        lines.push(`### Changed (${changed.length})`);
-        lines.push("| Package | Before | After | Delta | Result |");
-        lines.push("|---|---|---|---|---|");
-        for (const item of changed) {
-            lines.push(compareItemRow(item, violationMap, true));
+        lines.push(`### Updated (${changed.length})`);
+        lines.push("| Package | Version | Gzip | Result |");
+        lines.push("|---|---|---|---|");
+        for (const dep of changed) {
+            const item = resultByName.get(dep.name);
+            const gzip = item?.status === "ok" ? formatBytes(item.gzip) : "—";
+            const prevVersion = dep.previousSpec.replace(/^[\^~>=<v]+/, "").split(/\s*\|\|\s*/)[0].split(/\s+/)[0];
+            lines.push(`| \`${dep.name}\` | ${prevVersion} → ${dep.version} | ${gzip} | ${auditResultCell(dep.name, resultByName, violationByName)} |`);
         }
         lines.push("");
     }
-    // Removed section (no sizes — just listing)
     if (removed.length > 0) {
         lines.push(`### Removed (${removed.length})`);
         lines.push("| Package |");
         lines.push("|---|");
-        for (const item of removed) {
-            lines.push(`| \`${item.package}\` |`);
+        for (const dep of removed) {
+            lines.push(`| \`${dep.name}\` |`);
         }
         lines.push("");
     }
-    // Summary row
-    const deltaStr = formatDelta(summary.total_gzip_delta);
-    const totalResult = totalViolation
-        ? `❌ over by ${formatBytes(totalViolation.over_by)}`
-        : summary.added_count + summary.changed_count > 0
-            ? "✅"
-            : "—";
-    lines.push(`**Total new gzip:** ${formatBytes(summary.total_new_gzip)} (delta: ${deltaStr}) ${totalResult}`);
-    lines.push("");
-    lines.push(`> ⚠️ \`total_gzip\` is the **sum of individual package costs** — not your real app bundle size.`);
-    if (summary.warning) {
-        lines.push(`> ⚠️ ${summary.warning}`);
+    if (audit && audit.summary.ok_count > 0) {
+        const totalResult = totalViolation ? `❌ over by ${formatBytes(totalViolation.over_by)}` : "✅";
+        lines.push(`**Total gzip: ${formatBytes(audit.summary.total_gzip)}** ${totalResult}`);
+        lines.push("");
+        lines.push(`> ⚠️ \`total_gzip\` is the sum of individual package costs — not your real app bundle size.`);
     }
     return lines.join("\n");
 }
@@ -36575,86 +36550,130 @@ async function runAuditMode(apiUrl, apiKey, githubToken, failOnViolation, failOn
     }
     applyExitCode(audit.pass, audit.violations, failOnViolation, failOnPartial, warnOnly);
 }
-async function runCompareMode(apiUrl, apiKey, githubToken, failOnViolation, failOnPartial, warnOnly) {
-    const lockfilePath = getInput("lockfile_path") || "package-lock.json";
-    // Resolve base ref: explicit input → PR base ref → fallback to origin/main
+// Strip range specifiers from a package.json version spec to get a usable version string.
+// Returns null for non-npm protocols (workspace:, file:, link:, etc.) that can't be bundled.
+function cleanVersion(spec) {
+    if (/^(workspace|file|link|portal|patch|git[+:]|github:|bitbucket:|gitlab:)/.test(spec) || spec === "*") {
+        return null;
+    }
+    const stripped = spec.replace(/^[\^~>=<v]+/, "").trim();
+    const first = stripped.split(/\s*\|\|\s*/)[0].trim().split(/\s+/)[0];
+    return first || null;
+}
+function diffDependencies(baseDeps, headDeps) {
+    const added = [];
+    const changed = [];
+    const removed = [];
+    for (const [name, spec] of Object.entries(headDeps)) {
+        const version = cleanVersion(spec);
+        if (version === null)
+            continue; // skip workspace/file/link/etc.
+        if (!(name in baseDeps)) {
+            added.push({ name, version });
+        }
+        else if (baseDeps[name] !== spec) {
+            changed.push({ name, version, previousSpec: baseDeps[name] });
+        }
+    }
+    for (const name of Object.keys(baseDeps)) {
+        if (!(name in headDeps)) {
+            removed.push({ name });
+        }
+    }
+    return { added, changed, removed };
+}
+async function runCompareMode(apiUrl, apiKey, githubToken, failOnViolation, failOnPartial, warnOnly, pollIntervalSeconds, pollTimeoutSeconds) {
+    const packageJsonPath = getInput("package_json_path") || "package.json";
     let baseRef = getInput("base_ref");
     if (!baseRef) {
         baseRef = github_context.payload.pull_request?.base?.ref
             ? `origin/${github_context.payload.pull_request.base.ref}`
             : "origin/main";
     }
-    info(`Comparing ${lockfilePath} — base: ${baseRef}`);
-    // Check if the lockfile actually changed before making any API call.
-    // An unchanged lockfile means no packages were added or bumped — nothing to audit.
-    try {
-        const changed = (0,external_node_child_process_namespaceObject.execSync)(`git diff --name-only ${baseRef} -- ${lockfilePath}`, {
-            encoding: "utf-8",
-            stdio: ["pipe", "pipe", "pipe"],
-        }).trim();
-        if (!changed) {
-            info(`${lockfilePath} is unchanged — skipping audit.`);
-            setOutput("pass", "true");
-            setOutput("total_gzip", "0");
-            setOutput("violation_count", "0");
-            return;
-        }
-    }
-    catch {
-        // git diff failed (shallow clone, detached HEAD, etc.) — continue and let the API handle it
-        warning("Could not determine if lockfile changed — proceeding with full compare.");
-    }
-    // Read head lockfile from disk
-    if (!(0,external_node_fs_namespaceObject.existsSync)(lockfilePath)) {
-        setFailed(`Lockfile not found: ${lockfilePath}. Run "actions/checkout" before this action.`);
+    info(`BundleCheck: comparing ${packageJsonPath} dependencies — base: ${baseRef}`);
+    // Read head package.json
+    if (!(0,external_node_fs_namespaceObject.existsSync)(packageJsonPath)) {
+        setFailed(`${packageJsonPath} not found. Run "actions/checkout" before this action.`);
         return;
     }
-    const headLockfile = (0,external_node_fs_namespaceObject.readFileSync)(lockfilePath, "utf-8");
-    // Read base lockfile from git
-    let baseLockfile;
+    let headDeps;
     try {
-        baseLockfile = (0,external_node_child_process_namespaceObject.execSync)(`git show ${baseRef}:${lockfilePath}`, {
+        const raw = (0,external_node_fs_namespaceObject.readFileSync)(packageJsonPath, "utf-8");
+        headDeps = JSON.parse(raw).dependencies ?? {};
+    }
+    catch {
+        setFailed(`Failed to parse ${packageJsonPath}.`);
+        return;
+    }
+    // Read base package.json from git
+    let baseDeps = {};
+    try {
+        const raw = (0,external_node_child_process_namespaceObject.execSync)(`git show ${baseRef}:${packageJsonPath}`, {
             encoding: "utf-8",
             stdio: ["pipe", "pipe", "pipe"],
         });
+        baseDeps = JSON.parse(raw).dependencies ?? {};
     }
-    catch (err) {
-        // Base lockfile missing means this is a brand-new lockfile — treat everything as added
-        warning(`Could not read ${lockfilePath} from ${baseRef} — treating all packages as new. ` +
-            `Make sure "actions/checkout" runs with fetch-depth: 0.`);
-        // Return an empty lockfile in the correct format so the server can parse it
-        baseLockfile = lockfilePath.endsWith("yarn.lock")
-            ? "# yarn lockfile v1\n"
-            : JSON.stringify({ lockfileVersion: 3, packages: {} });
+    catch {
+        warning(`Could not read ${packageJsonPath} from ${baseRef} — treating all dependencies as new.`);
     }
-    const budget = parseBudget();
-    const compare = await postCompare(apiUrl, apiKey, baseLockfile, headLockfile, budget, failOnPartial);
-    setOutput("pass", String(compare.pass));
-    setOutput("total_gzip", String(compare.summary.total_new_gzip));
-    setOutput("violation_count", String(compare.violations.filter((v) => v.package !== "(total)").length));
-    const { added, changed, removed, summary } = compare;
+    const { added, changed, removed } = diffDependencies(baseDeps, headDeps);
     if (added.length + changed.length + removed.length === 0) {
-        info("No package changes detected — nothing to audit.");
+        info("No production dependency changes — skipping.");
+        setOutput("pass", "true");
+        setOutput("total_gzip", "0");
+        setOutput("violation_count", "0");
+        return;
     }
-    else {
-        info(`Added: ${summary.added_count}  Changed: ${summary.changed_count}  Removed: ${summary.removed_count}`);
-        for (const item of [...added, ...changed]) {
+    info(`Changes: ${added.length} added · ${changed.length} changed · ${removed.length} removed`);
+    const toAudit = [
+        ...added.map((p) => `${p.name}@${p.version}`),
+        ...changed.map((p) => `${p.name}@${p.version}`),
+    ];
+    let audit = null;
+    if (toAudit.length > 0) {
+        const budget = parseBudget();
+        const postResult = await postAudit(apiUrl, apiKey, {
+            packages: toAudit,
+            budget,
+            fail_on_partial: failOnPartial,
+        });
+        if (postResult.async) {
+            info(`Audit queued (${toAudit.length} packages). Polling for results…`);
+            audit = await pollAudit(apiUrl, apiKey, postResult.analysisId, pollIntervalSeconds, pollTimeoutSeconds);
+        }
+        else {
+            audit = postResult.data;
+        }
+        setOutput("pass", String(audit.pass));
+        setOutput("total_gzip", String(audit.summary.total_gzip));
+        setOutput("violation_count", String(audit.violations.filter((v) => v.package !== "(total)").length));
+        for (const item of audit.results) {
             if (item.status === "ok") {
                 info(`  ${item.pass ? "✅" : "❌"} ${item.package}: ${item.gzip} bytes gzip`);
             }
             else {
-                warning(`  ⚠️  ${item.package}: ${item.status} — ${item.error_message}`);
+                warning(`  ⚠️  ${item.package}: ${item.status}`);
             }
         }
     }
-    const commentBody = renderCompareComment(compare);
+    else {
+        // Only removals — no bundle analysis needed
+        setOutput("pass", "true");
+        setOutput("total_gzip", "0");
+        setOutput("violation_count", "0");
+    }
+    const addedNames = new Set(added.map((p) => p.name));
+    const commentBody = renderDepsComment({ added, changed, removed, audit, addedNames });
     try {
         await upsertComment(githubToken, commentBody);
     }
     catch (err) {
         warning(prCommentWarning(err));
     }
-    applyExitCode(compare.pass, compare.violations, failOnViolation, failOnPartial, warnOnly);
+    if (audit) {
+        applyExitCode(audit.pass, audit.violations, failOnViolation, failOnPartial, warnOnly);
+    }
 }
 function applyExitCode(pass, violations, failOnViolation, failOnPartial, warnOnly) {
     if (warnOnly) {
@@ -36706,7 +36725,7 @@ async function run() {
         await runAuditMode(apiUrl, apiKey, githubToken, failOnViolation, failOnPartial, warnOnly, pollIntervalSeconds, pollTimeoutSeconds, explicitPackages);
     }
     else {
-        await runCompareMode(apiUrl, apiKey, githubToken, failOnViolation, failOnPartial, warnOnly);
+        await runCompareMode(apiUrl, apiKey, githubToken, failOnViolation, failOnPartial, warnOnly, pollIntervalSeconds, pollTimeoutSeconds);
     }
 }
 run().catch((err) => {

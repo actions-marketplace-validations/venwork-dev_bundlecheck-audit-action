@@ -1,4 +1,4 @@
-import type { AuditResponse, AuditResultItem, AuditViolation, CompareResponse, CompareItem } from "./api";
+import type { AuditResponse, AuditResultItem, AuditViolation } from "./api";
 
 export const COMMENT_MARKER = "<!-- bundlecheck-audit -->";
 
@@ -83,105 +83,102 @@ export function renderComment(audit: AuditResponse): string {
   return lines.join("\n");
 }
 
-// --- Compare comment ---
+// --- Deps comment (package.json-based compare) ---
 
-function formatDelta(delta: number | null): string {
-  if (delta === null) return "—";
-  if (delta === 0) return "±0";
-  return delta > 0 ? `+${formatBytes(delta)}` : `-${formatBytes(Math.abs(delta))}`;
+interface AddedDep { name: string; version: string }
+interface ChangedDep { name: string; version: string; previousSpec: string }
+interface RemovedDep { name: string }
+
+export interface DepsCommentData {
+  added: AddedDep[];
+  changed: ChangedDep[];
+  removed: RemovedDep[];
+  audit: AuditResponse | null;
+  addedNames: Set<string>;
 }
 
-function compareItemRow(
-  item: CompareItem,
-  violationMap: Map<string, AuditViolation>,
-  showPrevious: boolean
-): string {
-  const gzip = item.status === "ok" ? formatBytes(item.gzip) : "—";
-  const prev = showPrevious
-    ? item.previous_gzip != null
-      ? formatBytes(item.previous_gzip)
-      : "—"
-    : null;
-  const delta = item.status === "ok" ? formatDelta(item.gzip_delta) : "—";
+function extractPackageName(nameAtVersion: string): string {
+  // @scope/pkg@1.0.0 → @scope/pkg,  pkg@1.0.0 → pkg
+  if (nameAtVersion.startsWith("@")) {
+    const rest = nameAtVersion.slice(1);
+    const afterSlash = rest.slice(rest.indexOf("/") + 1);
+    const atIdx = afterSlash.indexOf("@");
+    return atIdx !== -1 ? `@${rest.slice(0, rest.indexOf("/") + 1)}${afterSlash.slice(0, atIdx)}` : nameAtVersion;
+  }
+  return nameAtVersion.split("@")[0];
+}
 
-  let result: string;
-  if (item.status !== "ok") {
-    result = `⚠️ ${item.status}`;
-  } else if (!item.pass) {
-    const v = violationMap.get(item.package);
-    result = v ? `❌ over by ${formatBytes(v.over_by)}` : "❌";
-  } else {
-    result = "✅";
+function auditResultCell(name: string, resultByName: Map<string, AuditResultItem>, violationByName: Map<string, AuditViolation>): string {
+  const item = resultByName.get(name);
+  if (!item) return "—";
+  if (item.status !== "ok") return `⚠️ ${item.status}`;
+  const v = violationByName.get(name);
+  return v ? `❌ over by ${formatBytes(v.over_by)}` : "✅";
+}
+
+export function renderDepsComment(data: DepsCommentData): string {
+  const { added, changed, removed, audit } = data;
+
+  const resultByName = new Map<string, AuditResultItem>();
+  const violationByName = new Map<string, AuditViolation>();
+
+  if (audit) {
+    for (const item of audit.results) {
+      resultByName.set(extractPackageName(item.package), item);
+    }
+    for (const v of audit.violations.filter((v) => v.package !== "(total)")) {
+      violationByName.set(extractPackageName(v.package), v);
+    }
   }
 
-  const cells = showPrevious
-    ? [`\`${item.package}\``, prev ?? "—", gzip, delta, result]
-    : [`\`${item.package}\``, gzip, delta, result];
-
-  return `| ${cells.join(" | ")} |`;
-}
-
-export function renderCompareComment(compare: CompareResponse): string {
-  const { pass, added, changed, removed, violations, summary } = compare;
-
-  const violationMap = new Map(
-    violations.filter((v) => v.package !== "(total)").map((v) => [v.package, v])
-  );
-  const totalViolation = violations.find((v) => v.package === "(total)");
-
+  const totalViolation = audit?.violations.find((v) => v.package === "(total)");
+  const pass = !audit || audit.pass;
   const heading = pass
     ? "## ✅ BundleCheck — no size regressions"
     : "## ❌ BundleCheck — size budget violated";
 
   const lines: string[] = [COMMENT_MARKER, heading, ""];
 
-  // Added section
   if (added.length > 0) {
     lines.push(`### Added (${added.length})`);
-    lines.push("| Package | Gzip | Delta | Result |");
+    lines.push("| Package | Version | Gzip | Result |");
     lines.push("|---|---|---|---|");
-    for (const item of added) {
-      lines.push(compareItemRow(item, violationMap, false));
+    for (const dep of added) {
+      const item = resultByName.get(dep.name);
+      const gzip = item?.status === "ok" ? formatBytes(item.gzip) : "—";
+      lines.push(`| \`${dep.name}\` | ${dep.version} | ${gzip} | ${auditResultCell(dep.name, resultByName, violationByName)} |`);
     }
     lines.push("");
   }
 
-  // Changed section
   if (changed.length > 0) {
-    lines.push(`### Changed (${changed.length})`);
-    lines.push("| Package | Before | After | Delta | Result |");
-    lines.push("|---|---|---|---|---|");
-    for (const item of changed) {
-      lines.push(compareItemRow(item, violationMap, true));
+    lines.push(`### Updated (${changed.length})`);
+    lines.push("| Package | Version | Gzip | Result |");
+    lines.push("|---|---|---|---|");
+    for (const dep of changed) {
+      const item = resultByName.get(dep.name);
+      const gzip = item?.status === "ok" ? formatBytes(item.gzip) : "—";
+      const prevVersion = dep.previousSpec.replace(/^[\^~>=<v]+/, "").split(/\s*\|\|\s*/)[0].split(/\s+/)[0];
+      lines.push(`| \`${dep.name}\` | ${prevVersion} → ${dep.version} | ${gzip} | ${auditResultCell(dep.name, resultByName, violationByName)} |`);
     }
     lines.push("");
   }
 
-  // Removed section (no sizes — just listing)
   if (removed.length > 0) {
     lines.push(`### Removed (${removed.length})`);
     lines.push("| Package |");
     lines.push("|---|");
-    for (const item of removed) {
-      lines.push(`| \`${item.package}\` |`);
+    for (const dep of removed) {
+      lines.push(`| \`${dep.name}\` |`);
     }
     lines.push("");
   }
 
-  // Summary row
-  const deltaStr = formatDelta(summary.total_gzip_delta);
-  const totalResult = totalViolation
-    ? `❌ over by ${formatBytes(totalViolation.over_by)}`
-    : summary.added_count + summary.changed_count > 0
-    ? "✅"
-    : "—";
-
-  lines.push(`**Total new gzip:** ${formatBytes(summary.total_new_gzip)} (delta: ${deltaStr}) ${totalResult}`);
-  lines.push("");
-  lines.push(`> ⚠️ \`total_gzip\` is the **sum of individual package costs** — not your real app bundle size.`);
-
-  if (summary.warning) {
-    lines.push(`> ⚠️ ${summary.warning}`);
+  if (audit && audit.summary.ok_count > 0) {
+    const totalResult = totalViolation ? `❌ over by ${formatBytes(totalViolation.over_by)}` : "✅";
+    lines.push(`**Total gzip: ${formatBytes(audit.summary.total_gzip)}** ${totalResult}`);
+    lines.push("");
+    lines.push(`> ⚠️ \`total_gzip\` is the sum of individual package costs — not your real app bundle size.`);
   }
 
   return lines.join("\n");
